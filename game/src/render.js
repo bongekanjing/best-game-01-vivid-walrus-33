@@ -2,9 +2,15 @@
 // is a shape, a gradient or a short line of text, so the game has no assets at all and still has a
 // look: a cold blue night, a warm ember glow, and a moth carrying the last flame.
 
-import { ARENA, BLOOM, PALETTE, PLAYER, VIEW } from './config.js';
+import { ARENA, BLOOM, PALETTE, PLAYER, VIEW, WAVE } from './config.js';
+import { BOONS, countBoons } from './boons.js';
 import { KIND_ENEMY, KIND_SPARK, KIND_SPIT } from './world.js';
 import { clamp, easeOutCubic, formatClock } from './util.js';
+
+/** Two decimals at most, with no trailing zeros: a stat readout, not a measurement. */
+function round2(value) {
+  return String(Math.round(value * 100) / 100);
+}
 
 export const SCREEN_TITLE = 'title';
 export const SCREEN_PLAY = 'play';
@@ -28,7 +34,7 @@ const COLOUR = {
   nightDeep: PALETTE.nightDeep,
 };
 
-export function createRenderer(canvas) {
+export function createRenderer(canvas, { shotMode = false } = {}) {
   const ctx = canvas.getContext('2d', { alpha: false });
   /** A fixed star field, so the background never shimmers between frames. */
   const stars = makeStars(150);
@@ -36,9 +42,12 @@ export function createRenderer(canvas) {
 
   /** Fit the logical 1280x720 field into whatever the window is, letterboxed and crisp. */
   function resize() {
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const width = Math.max(1, Math.floor(window.innerWidth * dpr));
-    const height = Math.max(1, Math.floor(window.innerHeight * dpr));
+    // In a screenshot scene the canvas is the field itself. The page is captured at exactly 1280x720,
+    // but a headless viewport is 80 px shorter than the window (browser chrome), so fitting to
+    // innerHeight would scale the game to 89% and leave a dead band across the bottom of every shot.
+    // The capture is the deliverable here, so the frame drops the fit and draws 1:1.
+    const width = shotMode ? VIEW.width : Math.max(1, Math.floor(window.innerWidth * (window.devicePixelRatio || 1)));
+    const height = shotMode ? VIEW.height : Math.max(1, Math.floor(window.innerHeight * (window.devicePixelRatio || 1)));
     if (canvas.width !== width || canvas.height !== height) {
       canvas.width = width;
       canvas.height = height;
@@ -65,12 +74,32 @@ export function createRenderer(canvas) {
     drawBackdrop(state);
     drawArena(state);
     if (state) {
-      drawMotes(state);
-      drawBodies(state);
-      drawParticles(state);
-      drawPlayer(state);
+      // The stage is the arena: nothing the simulation owns is drawn outside its frame. Without
+      // this clip a glow or a stray tracer paints into the black letterbox and the arena edge stops
+      // reading as a boundary.
+      //
+      // A results card is not a fight. Bodies, sparks and score pops behind the card read as smears
+      // through the veil, so the card gets the empty night sky instead — the bokeh in the backdrop
+      // is deliberate, a half-erased warden at 6% opacity is not.
+      const results = overlay === SCREEN_OVER || overlay === SCREEN_WIN;
+      if (!results) {
+        ctx.save();
+        roundRect(ARENA.x, ARENA.y, ARENA.width, ARENA.height, 22);
+        ctx.clip();
+        drawMotes(state);
+        drawBodies(state);
+        drawParticles(state);
+        drawPlayer(state);
+        // Score pops last, over the field: a number for a kill the player just earned cannot be
+        // occluded by the body it was earned on, which is exactly where it is spawned.
+        drawPopups(state);
+        ctx.restore();
+      }
+      // The live HUD is for the fight only. A results card that still shows hearts, the run clock
+      // and a kill count behind it repeats the card's own stats in a second, misaligned place.
+      if (!results) drawHud(state);
       drawOverlayLayer(state, overlay, extra);
-      drawHud(state);
+      drawBanner(state, overlay);
     }
   }
 
@@ -183,9 +212,28 @@ export function createRenderer(canvas) {
     ctx.translate(body.x, body.y);
     ctx.rotate(body.angle * 0.35);
 
+    // An elite wears a rotating crown of spikes, drawn under the body so the silhouette reads first.
+    if (body.elite) {
+      ctx.save();
+      ctx.rotate(-body.angle * 0.35 + (body.stateClock || 0) * 1.1);
+      ctx.strokeStyle = 'rgba(255, 230, 168, 0.85)';
+      ctx.lineWidth = 2;
+      const spikes = 9;
+      for (let i = 0; i < spikes; i += 1) {
+        const angle = (i / spikes) * Math.PI * 2;
+        const inner = body.radius * 1.18;
+        const outer = body.radius * (i % 2 === 0 ? 1.62 : 1.4);
+        ctx.beginPath();
+        ctx.moveTo(Math.cos(angle) * inner, Math.sin(angle) * inner);
+        ctx.lineTo(Math.cos(angle) * outer, Math.sin(angle) * outer);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
     // A soft halo in the body's own colour separates it from whatever is behind it.
     const aura = ctx.createRadialGradient(0, 0, body.radius * 0.5, 0, 0, body.radius * 1.85);
-    aura.addColorStop(0, hexAlpha(colour, 0.34));
+    aura.addColorStop(0, hexAlpha(colour, body.elite ? 0.5 : 0.34));
     aura.addColorStop(1, hexAlpha(colour, 0));
     ctx.fillStyle = aura;
     ctx.beginPath();
@@ -316,15 +364,16 @@ export function createRenderer(canvas) {
     ctx.fill();
     ctx.restore();
 
-    // A hairline health bar over anything that has taken a knock, and always over a warden.
-    if (body.boss || body.hp < body.maxHp) {
-      const width = body.boss ? 120 : body.radius * 2.4;
-      const height = body.boss ? 7 : 3.5;
+    // A hairline health bar over anything that has taken a knock. Never over a warden: the HUD's long
+    // bar already tracks its health, and two bars for one body at different fills reads as a bug.
+    if (!body.boss && body.hp < body.maxHp) {
+      const width = body.radius * 2.4;
+      const height = 3.5;
       const x = body.x - width / 2;
-      const y = body.y - body.radius - (body.boss ? 20 : 11);
+      const y = body.y - body.radius - 11;
       ctx.fillStyle = 'rgba(5, 7, 15, 0.75)';
       ctx.fillRect(x - 1, y - 1, width + 2, height + 2);
-      ctx.fillStyle = body.boss ? PALETTE.ember : PALETTE.blood;
+      ctx.fillStyle = PALETTE.blood;
       ctx.fillRect(x, y, width * clamp(body.hp / body.maxHp, 0, 1), height);
     }
   }
@@ -350,26 +399,60 @@ export function createRenderer(canvas) {
     ctx.lineTo(body.x, body.y);
     ctx.stroke();
     ctx.globalAlpha = fade;
-    ctx.fillStyle = '#fff8e2';
+    // The keeper's fire wears the same construction as a spit — a dark separator ring around a hot
+    // core — so the two projectiles on the field are told apart by colour and never by brightness.
+    // Without the ring a warm speck is indistinguishable from a star, and a mint rim made it
+    // indistinguishable from a bloom mote, which is the pickup the player is meant to chase.
+    ctx.beginPath();
+    ctx.arc(body.x, body.y, body.radius + 1.5, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(4, 6, 13, 0.9)';
+    ctx.fill();
+
     ctx.beginPath();
     ctx.arc(body.x, body.y, body.radius, 0, Math.PI * 2);
+    ctx.fillStyle = '#fff8e2';
+    ctx.fill();
+
+    // A point of white on the leading edge: the spark has a direction as well as a colour.
+    ctx.globalAlpha = fade * 0.9;
+    ctx.beginPath();
+    ctx.arc(body.x + Math.cos(body.angle) * body.radius * 0.3,
+      body.y + Math.sin(body.angle) * body.radius * 0.3, body.radius * 0.4, 0, Math.PI * 2);
+    ctx.fillStyle = '#ffffff';
     ctx.fill();
     ctx.restore();
   }
 
+  /** A spit is the one thing that hurts the keeper on contact, so it is drawn as a hard, hot
+   *  projectile: a white core inside a saturated rim inside a black ring. Nothing in the backdrop or
+   *  the pickup set has that outline, so it can never be mistaken for ambience at a glance. */
   function drawSpit(body) {
-    const pulse = 1 + Math.sin(body.life * 22) * 0.12;
+    const pulse = 1 + Math.sin(body.life * 22) * 0.1;
+    const r = body.radius * pulse;
     ctx.save();
-    const halo = ctx.createRadialGradient(body.x, body.y, 1, body.x, body.y, body.radius * 3);
-    halo.addColorStop(0, 'rgba(255, 77, 109, 0.4)');
+    const halo = ctx.createRadialGradient(body.x, body.y, 1, body.x, body.y, r * 3);
+    halo.addColorStop(0, 'rgba(255, 77, 109, 0.42)');
     halo.addColorStop(1, 'rgba(255, 77, 109, 0)');
     ctx.fillStyle = halo;
     ctx.beginPath();
-    ctx.arc(body.x, body.y, body.radius * 3, 0, Math.PI * 2);
+    ctx.arc(body.x, body.y, r * 3, 0, Math.PI * 2);
     ctx.fill();
-    ctx.fillStyle = body.colour === 'rot' ? PALETTE.rot : PALETTE.ember;
+
+    // The dark ring: this is what separates a spit from a mote or a star.
     ctx.beginPath();
-    ctx.arc(body.x, body.y, body.radius * pulse, 0, Math.PI * 2);
+    ctx.arc(body.x, body.y, r + 2.2, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(4, 6, 13, 0.95)';
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.arc(body.x, body.y, r, 0, Math.PI * 2);
+    ctx.fillStyle = body.colour === 'rot' ? PALETTE.rot : PALETTE.ember;
+    ctx.fill();
+
+    // The hot core and a small specular bead: reads as fast and dangerous, not as a glow.
+    ctx.beginPath();
+    ctx.arc(body.x, body.y, r * 0.52, 0, Math.PI * 2);
+    ctx.fillStyle = '#fffaf0';
     ctx.fill();
     ctx.restore();
   }
@@ -403,13 +486,22 @@ export function createRenderer(canvas) {
 
     // The lantern halo: the keeper is the brightest small thing on the field, so it always reads.
     const halo = ctx.createRadialGradient(0, 0, 4, 0, 0, 82);
-    halo.addColorStop(0, `rgba(255, 236, 190, ${0.42 * flicker})`);
-    halo.addColorStop(0.4, 'rgba(255, 181, 74, 0.16)');
+    halo.addColorStop(0, `rgba(255, 236, 190, ${0.46 * flicker})`);
+    halo.addColorStop(0.35, 'rgba(255, 181, 74, 0.20)');
+    halo.addColorStop(0.62, 'rgba(125, 226, 209, 0.10)');
     halo.addColorStop(1, 'rgba(255, 181, 74, 0)');
     ctx.fillStyle = halo;
     ctx.beginPath();
     ctx.arc(0, 0, 82, 0, Math.PI * 2);
     ctx.fill();
+
+    // A cold ring at the halo's edge. Nothing else on the field wears cyan in a circle, so at
+    // thumbnail size — where the body is three pixels of cream — this ring is what finds the keeper.
+    ctx.strokeStyle = 'rgba(125, 226, 209, 0.34)';
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.arc(0, 0, player.radius + 21, 0, Math.PI * 2);
+    ctx.stroke();
 
     // The dash and the hit invulnerability both read as a ring around the body.
     if (state.dashTime > 0) {
@@ -427,6 +519,29 @@ export function createRenderer(canvas) {
       ctx.arc(0, 0, player.radius + 7, 0, Math.PI * 2);
       ctx.stroke();
       ctx.globalAlpha = 1;
+    }
+
+    // The muzzle flash: for the first half of every cooldown a short hot wedge sits along the aim
+    // line. It is the one mark that ties the sparks in flight to the body that fired them — without
+    // it a volley reads as ambient light that happens to be near the keeper.
+    const cooldown = state.stats?.cooldown || 0.24;
+    const flash = clamp(state.fireClock / cooldown, 0, 1);
+    if (flash > 0) {
+      const reach = player.radius + 26 - 10 * (1 - flash);
+      const spread = 0.30 + 0.14 * (1 - flash);
+      ctx.save();
+      ctx.rotate(player.aim);
+      ctx.globalAlpha = 0.62 * flash;
+      const wedge = ctx.createLinearGradient(0, 0, reach, 0);
+      wedge.addColorStop(0, 'rgba(255, 236, 190, 0.95)');
+      wedge.addColorStop(1, 'rgba(255, 181, 74, 0)');
+      ctx.fillStyle = wedge;
+      ctx.beginPath();
+      ctx.moveTo(player.radius * 0.6, 0);
+      ctx.arc(0, 0, reach, -spread, spread);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
     }
 
     ctx.rotate(player.aim + Math.PI / 2);
@@ -522,70 +637,118 @@ export function createRenderer(canvas) {
   /** The HUD: hearts, score, wave, clock and the combo, along the top of the field. */
   function drawHud(state) {
     ctx.save();
-    ctx.fillStyle = 'rgba(5, 7, 15, 0.42)';
-    roundRect(ARENA.x + 10, ARENA.y + 10, ARENA.width - 20, 56, 14);
+    // Opaque enough that a body drifting up the screen cannot read as part of the readout: the
+    // strip is a bar, not a wash, so nothing behind it is mistaken for a meter or a health bar.
+    const strip = ctx.createLinearGradient(0, ARENA.y + 10, 0, ARENA.y + 70);
+    strip.addColorStop(0, 'rgba(5, 7, 15, 0.88)');
+    strip.addColorStop(1, 'rgba(5, 7, 15, 0.72)');
+    ctx.fillStyle = strip;
+    roundRect(ARENA.x + 10, ARENA.y + 10, ARENA.width - 20, 60, 14);
     ctx.fill();
 
     // Hearts.
     for (let i = 0; i < state.player.maxHp; i += 1) {
       const full = i < state.player.hp;
-      drawHeart(ARENA.x + 40 + i * 30, ARENA.y + 38, full);
+      drawHeart(ARENA.x + 40 + i * 30, ARENA.y + 34, full);
+    }
+
+    // The flawless tally sits beside the hearts, inside the strip: it is the run's second score and
+    // it does not belong floating over the playfield where a body can drift through it.
+    if (state.flawless > 0) {
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      // Bright, not dim red: this is the stat the whole scoring bonus hangs on, and at 12 px in dark
+      // red it was the one readout that failed a contrast check at a glance.
+      ctx.fillStyle = PALETTE.moth;
+      ctx.font = '800 13px ui-sans-serif, system-ui, sans-serif';
+      ctx.fillText(`${state.flawless} flawless`, ARENA.x + 46, ARENA.y + 54);
     }
 
     // Score, with the combo multiplier beside it when it is above one.
     ctx.textAlign = 'left';
     ctx.textBaseline = 'middle';
     ctx.fillStyle = PALETTE.ash;
-    ctx.font = '600 12px ui-sans-serif, system-ui, sans-serif';
-    ctx.fillText('SCORE', ARENA.x + 210, ARENA.y + 28);
+    ctx.font = '700 13px ui-sans-serif, system-ui, sans-serif';
+    ctx.fillText('SCORE', ARENA.x + 210, ARENA.y + 27);
     ctx.fillStyle = PALETTE.bone;
-    ctx.font = '700 24px ui-sans-serif, system-ui, sans-serif';
-    ctx.fillText(String(state.score).padStart(5, '0'), ARENA.x + 210, ARENA.y + 46);
+    ctx.font = '800 28px ui-sans-serif, system-ui, sans-serif';
+    // The same thousands-separated figures the results card prints: a score that gains a comma only
+    // once the run ends reads as a different number, not the same one getting bigger.
+    ctx.fillText(state.score.toLocaleString('en-US'), ARENA.x + 210, ARENA.y + 50);
     if (state.combo > 1.02) {
       ctx.fillStyle = PALETTE.ember;
       ctx.font = '700 15px ui-sans-serif, system-ui, sans-serif';
-      ctx.fillText(`x${state.combo.toFixed(2)}`, ARENA.x + 320, ARENA.y + 46);
+      ctx.fillText(`x${state.combo.toFixed(2)}`, ARENA.x + 330, ARENA.y + 48);
     }
 
     // Wave, centred.
     ctx.textAlign = 'center';
-    ctx.fillStyle = PALETTE.ash;
-    ctx.font = '600 12px ui-sans-serif, system-ui, sans-serif';
+    ctx.fillStyle = PALETTE.ember;
+    ctx.font = '800 14px ui-sans-serif, system-ui, sans-serif';
     // A death ends the run too, so the banner keys off the win, not the phase: a run that fell in
     // wave eight says so, rather than claiming it reached the final.
     const waveLabel = state.won ? 'ALL TEN HELD' : `WAVE ${Math.min(state.waveIndex + 1, 10)} / 10`;
-    ctx.fillText(waveLabel, VIEW.width / 2, ARENA.y + 28);
-    ctx.fillStyle = PALETTE.ember;
-    ctx.font = '700 17px ui-sans-serif, system-ui, sans-serif';
-    ctx.fillText(state.waveName || 'Gathering', VIEW.width / 2, ARENA.y + 48);
+    ctx.fillText(waveLabel, VIEW.width / 2, ARENA.y + 27);
+    ctx.fillStyle = PALETTE.wick;
+    ctx.font = '700 21px ui-sans-serif, system-ui, sans-serif';
+    ctx.fillText(state.waveName || 'Gathering', VIEW.width / 2, ARENA.y + 51);
 
-    // Clock and the broom/kill count.
+    // Clock and the kill count.
     ctx.textAlign = 'right';
     ctx.fillStyle = PALETTE.ash;
-    ctx.font = '600 12px ui-sans-serif, system-ui, sans-serif';
-    ctx.fillText('TIME', ARENA.x + ARENA.width - 150, ARENA.y + 28);
+    ctx.font = '700 13px ui-sans-serif, system-ui, sans-serif';
+    ctx.fillText('TIME', ARENA.x + ARENA.width - 160, ARENA.y + 27);
     ctx.fillStyle = PALETTE.bone;
-    ctx.font = '700 20px ui-sans-serif, system-ui, sans-serif';
-    ctx.fillText(formatClock(state.time), ARENA.x + ARENA.width - 150, ARENA.y + 46);
-    ctx.fillStyle = PALETTE.ash;
-    ctx.font = '600 12px ui-sans-serif, system-ui, sans-serif';
-    ctx.fillText(`${state.kills} slain`, ARENA.x + ARENA.width - 40, ARENA.y + 46);
+    ctx.font = '800 26px ui-sans-serif, system-ui, sans-serif';
+    ctx.fillText(formatClock(state.time), ARENA.x + ARENA.width - 160, ARENA.y + 50);
+    // Kills in the warm accent, not grey: at thumbnail size grey-on-black is the first thing gone,
+    // and the kill count is the number that says the loop is rewarding.
+    ctx.fillStyle = PALETTE.ember;
+    ctx.font = '700 15px ui-sans-serif, system-ui, sans-serif';
+    ctx.fillText(`${state.kills} slain`, ARENA.x + ARENA.width - 40, ARENA.y + 50);
 
-    // The warden's long health bar, under the HUD, while it lives.
+    // The build the run has drafted, on its own slim bar along the arena floor. In the playfield they
+      // read as enemy name plates floating over the fight; on a bar that mirrors the HUD strip they are
+      // unmistakably part of the readout, and the loop's payoff is visible during the fight itself.
+      const footerY = ARENA.y + ARENA.height - 40;
+      if ((state.boons ?? []).length > 0) {
+        // Opaque, like the top strip: a body drifting along the floor otherwise shows through the
+        // dock and reads as an enemy half-buried in the HUD.
+        const bar = ctx.createLinearGradient(0, footerY, 0, footerY + 32);
+        bar.addColorStop(0, 'rgba(5, 7, 15, 0.86)');
+        bar.addColorStop(1, 'rgba(5, 7, 15, 0.94)');
+        ctx.fillStyle = bar;
+        roundRect(ARENA.x + 10, footerY, ARENA.width - 20, 32, 12);
+        ctx.fill();
+      }
+      drawBuildStrip(state, footerY + 16);
+
+    // The warden's long health bar, under the strip, while it lives: the name gets its own line
+    // above the track with a clear gap, so a label never sits on top of the bar it labels. The plate
+    // behind it keeps a body that has drifted up the field from printing over the warden's name.
     if (state.boss && state.boss.hp > 0) {
       const width = 420;
       const x = VIEW.width / 2 - width / 2;
-      const y = ARENA.y + 78;
-      ctx.fillStyle = 'rgba(5, 7, 15, 0.6)';
-      roundRect(x - 2, y - 2, width + 4, 12, 6);
+      const y = ARENA.y + 98;
+      ctx.fillStyle = 'rgba(5, 7, 15, 0.78)';
+      roundRect(x - 26, y - 40, width + 52, 60, 10);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(5, 7, 15, 0.72)';
+      roundRect(x - 3, y - 3, width + 6, 14, 7);
+      ctx.fill();
+      // The spent track is a dim bar, not a bright one: a lighter grey ghost reads as a second,
+      // healthier bar rather than as the part already taken off.
+      ctx.fillStyle = 'rgba(233, 239, 249, 0.09)';
+      roundRect(x, y, width, 8, 4);
       ctx.fill();
       ctx.fillStyle = PALETTE.flame;
       roundRect(x, y, width * clamp(state.boss.hp / state.bossMaxHp, 0, 1), 8, 4);
       ctx.fill();
       ctx.fillStyle = PALETTE.wick;
       ctx.textAlign = 'center';
+      ctx.textBaseline = 'alphabetic';
       ctx.font = '700 12px ui-sans-serif, system-ui, sans-serif';
-      ctx.fillText(state.boss.name.toUpperCase(), VIEW.width / 2, y - 10);
+      ctx.fillText(state.boss.name.toUpperCase(), VIEW.width / 2, y - 14);
     }
 
     if (state.hurtFlash > 0) {
@@ -597,6 +760,134 @@ export function createRenderer(canvas) {
     ctx.restore();
   }
 
+  /**
+   * The drafted build, as chips on the arena floor. Each chip is the boon's tone colour and its
+   * count, so the row reads as a build at a glance and stays legible at thumbnail size: a chip says
+   * *which* axis was taken and *how deep*, which no single stat readout on the HUD can show.
+   */
+  function drawBuildStrip(state, atY = ARENA.y + ARENA.height - 30) {
+    const taken = state.boons ?? [];
+    if (taken.length === 0) return;
+    const counts = countBoons(taken);
+    const order = BOONS.filter((boon) => counts.has(boon.id));
+    if (order.length === 0) return;
+
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = '700 12px ui-sans-serif, system-ui, sans-serif';
+
+    const gap = 6;
+    const widths = order.map((boon) => {
+      const label = counts.get(boon.id) > 1 ? `${boon.name} ${counts.get(boon.id)}` : boon.name;
+      return ctx.measureText(label).width + 22;
+    });
+    const total = widths.reduce((sum, width) => sum + width, 0) + gap * (order.length - 1);
+    let x = VIEW.width / 2 - total / 2;
+    const y = atY;
+
+    order.forEach((boon, index) => {
+      const width = widths[index];
+      const hue = PALETTE[boon.tone] ?? PALETTE.ember;
+      ctx.fillStyle = 'rgba(5, 7, 15, 0.82)';
+      roundRect(x, y - 13, width, 26, 13);
+      ctx.fill();
+      ctx.strokeStyle = hue;
+      ctx.globalAlpha = 0.45;
+      ctx.lineWidth = 1;
+      roundRect(x, y - 13, width, 26, 13);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = hue;
+      const label = counts.get(boon.id) > 1 ? `${boon.name} ${counts.get(boon.id)}` : boon.name;
+      ctx.fillText(label, x + width / 2, y);
+      x += width + gap;
+    });
+    ctx.restore();
+  }
+
+  /** Score pops: the number every kill was worth, floating where it died. */
+  function drawPopups(state) {
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    for (const popup of state.popups) {
+      const fade = clamp(popup.life / (popup.maxLife || 1), 0, 1);
+      ctx.globalAlpha = fade * fade * 0.95;
+      // A merged pop grows with what it swallowed, so one number carries the whole burst.
+      const size = popup.kind === 'kill' ? 13 + Math.min(popup.merges ?? 1, 5) * 2.2 : 19;
+      ctx.font = `800 ${size.toFixed(1)}px ui-sans-serif, system-ui, sans-serif`;
+      // Struck first in near-black, then filled: without the stroke a pop shares its value with the
+      // ambient spark dust and stops reading as feedback the moment the field gets busy.
+      ctx.lineWidth = 3;
+      ctx.lineJoin = 'round';
+      ctx.strokeStyle = 'rgba(5, 7, 15, 0.9)';
+      ctx.strokeText(`+${popup.value}`, popup.x, popup.y);
+      ctx.fillStyle = popup.kind === 'boss' ? PALETTE.ember : popup.kind === 'elite' ? PALETTE.wick : PALETTE.moth;
+      ctx.fillText(`+${popup.value}`, popup.x, popup.y);
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  /** The wave banner: a banded announcement across the field, and the flawless call-out. */
+  function drawBanner(state, overlay) {
+    if (overlay || !state.banner || state.bannerClock <= 0) return;
+    const total = state.bannerKind === 'flawless' ? 1.5 : WAVE.bannerTime;
+    const age = 1 - clamp(state.bannerClock / total, 0, 1);
+    const inAlpha = clamp(age / 0.18, 0, 1);
+    const outAlpha = clamp((1 - age) / 0.3, 0, 1);
+    const alpha = Math.min(inAlpha, outAlpha);
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    // A band, not a floating headline: the announcement sits on its own dark plate so the fight
+    // behind it never competes with the words, and the plate gives it an edge to read against.
+    const bandHeight = state.bannerKind === 'flawless' ? 56 : 74;
+    const y = 232 + (1 - easeOutCubic(clamp(age / 0.22, 0, 1))) * 16;
+    const plate = ctx.createLinearGradient(0, y - bandHeight / 2, 0, y + bandHeight / 2);
+    plate.addColorStop(0, 'rgba(5, 7, 15, 0)');
+    plate.addColorStop(0.22, 'rgba(5, 7, 15, 0.82)');
+    plate.addColorStop(0.78, 'rgba(5, 7, 15, 0.82)');
+    plate.addColorStop(1, 'rgba(5, 7, 15, 0)');
+    ctx.fillStyle = plate;
+    ctx.fillRect(ARENA.x, y - bandHeight / 2, ARENA.width, bandHeight);
+
+    // A hairline above and below the band, in the banner's own colour, so the announcement reads as
+    // a framed title rather than as text that happened to land on the field.
+    const edge = state.bannerKind === 'flawless' ? PALETTE.moth : PALETTE.ember;
+    ctx.strokeStyle = edge;
+    ctx.globalAlpha = alpha * 0.4;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(VIEW.width / 2 - 260, y - bandHeight / 2 + 4);
+    ctx.lineTo(VIEW.width / 2 + 260, y - bandHeight / 2 + 4);
+    ctx.moveTo(VIEW.width / 2 - 260, y + bandHeight / 2 - 4);
+    ctx.lineTo(VIEW.width / 2 + 260, y + bandHeight / 2 - 4);
+    ctx.stroke();
+    ctx.globalAlpha = alpha;
+
+    ctx.fillStyle = state.bannerKind === 'flawless' ? PALETTE.moth : PALETTE.wick;
+    ctx.font = '800 30px ui-sans-serif, system-ui, sans-serif';
+    const line = state.bannerKind === 'flawless' ? state.banner.toUpperCase() : state.banner;
+    ctx.fillText(line, VIEW.width / 2, state.bannerKind === 'flawless' ? y : y - 9);
+    if (state.bannerKind !== 'flawless') {
+      ctx.fillStyle = PALETTE.ember;
+      ctx.font = '700 13px ui-sans-serif, system-ui, sans-serif';
+      ctx.fillText(
+        state.bannerKind === 'boss'
+          ? 'THE WARDEN WAKES'
+          : `WAVE ${Math.min(state.waveIndex + 1, 10)} OF TEN`,
+        VIEW.width / 2,
+        y + 18,
+      );
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
   function drawHeart(x, y, full) {
     ctx.save();
     ctx.translate(x, y);
@@ -605,11 +896,17 @@ export function createRenderer(canvas) {
     ctx.bezierCurveTo(-9, -3, -7, -10, 0, -5);
     ctx.bezierCurveTo(7, -10, 9, -3, 0, 5);
     ctx.closePath();
-    ctx.fillStyle = full ? PALETTE.blood : 'rgba(255, 77, 109, 0.16)';
+    ctx.fillStyle = full ? PALETTE.blood : 'rgba(255, 77, 109, 0.30)';
     ctx.fill();
     if (full) {
       ctx.strokeStyle = 'rgba(255, 230, 168, 0.55)';
       ctx.lineWidth = 1;
+      ctx.stroke();
+    } else {
+      // A drained heart keeps its outline so the count of what is left survives at thumbnail size:
+      // at 16% fill the empty pips vanished and three lives read as one.
+      ctx.strokeStyle = 'rgba(255, 77, 109, 0.62)';
+      ctx.lineWidth = 1.2;
       ctx.stroke();
     }
     ctx.restore();
@@ -632,61 +929,116 @@ export function createRenderer(canvas) {
     ctx.globalAlpha = entry;
     ctx.textAlign = 'center';
 
-    const glow = ctx.createRadialGradient(VIEW.width / 2, 300, 20, VIEW.width / 2, 300, 340);
-    glow.addColorStop(0, 'rgba(255, 181, 74, 0.18)');
+    const glow = ctx.createRadialGradient(VIEW.width / 2, 220, 20, VIEW.width / 2, 220, 360);
+    glow.addColorStop(0, 'rgba(255, 181, 74, 0.20)');
     glow.addColorStop(1, 'rgba(255, 181, 74, 0)');
     ctx.fillStyle = glow;
     ctx.fillRect(0, 0, VIEW.width, VIEW.height);
 
+    // The crest sits well above the wordmark: the moth is the emblem, not a watermark behind the
+    // type, so it gets its own band of the screen.
+    const bob = Math.sin((state?.time ?? 0) * 2.4) * 5;
+    drawTitleMoth(VIEW.width / 2, 122 + bob, state?.time ?? 0);
+
+    // A hairline either side of the wordmark, the cheapest way to make a centred title read as a
+    // deliberate lockup rather than a line of text that happens to be centred.
+    ctx.strokeStyle = 'rgba(255, 181, 74, 0.35)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(VIEW.width / 2 - 300, 214);
+    ctx.lineTo(VIEW.width / 2 - 226, 214);
+    ctx.moveTo(VIEW.width / 2 + 226, 214);
+    ctx.lineTo(VIEW.width / 2 + 300, 214);
+    ctx.stroke();
+
     ctx.fillStyle = PALETTE.wick;
-    ctx.font = '800 92px ui-sans-serif, system-ui, sans-serif';
-    ctx.fillText('WICKFALL', VIEW.width / 2, 268);
+    ctx.font = '800 86px ui-sans-serif, system-ui, sans-serif';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText('WICKFALL', VIEW.width / 2, 250);
     ctx.fillStyle = PALETTE.ember;
     ctx.font = '600 20px ui-sans-serif, system-ui, sans-serif';
-    ctx.fillText('Ten waves. One keeper. The last flame.', VIEW.width / 2, 308);
-    // The one line the tagline leaves out: what actually wins and loses. A player should not have
-    // to infer the rulebook from the verb list, and the start screen is where the goal belongs.
-    // Drawn one step brighter than the control text so it reads as the rule, not another control.
+    ctx.fillText('Ten waves. One keeper. The last flame.', VIEW.width / 2, 286);
+
+    // The rulebook, in a panel of its own so it is not skimmed as part of the control list: what
+    // wins and what loses are the two lines a new player has to read.
+    const panelWidth = 540;
+    const panelX = VIEW.width / 2 - panelWidth / 2;
+    ctx.fillStyle = 'rgba(255, 181, 74, 0.07)';
+    roundRect(panelX, 310, panelWidth, 64, 12);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255, 181, 74, 0.28)';
+    ctx.lineWidth = 1;
+    roundRect(panelX, 310, panelWidth, 64, 12);
+    ctx.stroke();
     ctx.fillStyle = PALETTE.bone;
-    ctx.font = '600 17px ui-sans-serif, system-ui, sans-serif';
-    ctx.fillText('Clear all ten waves to hold the flame.', VIEW.width / 2, 342);
-    ctx.fillStyle = PALETTE.ash;
-    ctx.font = '500 15px ui-sans-serif, system-ui, sans-serif';
-    ctx.fillText('Lose all three hearts and the wick goes out.', VIEW.width / 2, 366);
-
-    // A lone moth above the wordmark, beating its wings on the clock.
-    const bob = Math.sin((state?.time ?? 0) * 2.4) * 6;
-    drawTitleMoth(VIEW.width / 2, 170 + bob, state?.time ?? 0);
-
-    // The controls, one row each: the key in ember on the left, what it does in ash on the right.
+    ctx.font = '700 17px ui-sans-serif, system-ui, sans-serif';
+    ctx.fillText('Hold all ten waves to keep the flame.', VIEW.width / 2, 337);
+    ctx.fillStyle = PALETTE.bone;
     ctx.font = '600 15px ui-sans-serif, system-ui, sans-serif';
+    ctx.fillText('Lose all three hearts and the wick goes out.', VIEW.width / 2, 362);
+
+    // The controls as key caps in two measured columns, the whole table centred on the canvas:
+    // measure both columns first, then lay them out, so the block's own width decides its inset
+    // instead of a guess at where the middle is.
     const lines = [
-      ['WASD or arrows', 'move'],
-      ['mouse or J', 'throw sparks'],
-      ['space', 'dash through danger'],
-      ['shift or E', 'bloom, once the ring is lit'],
+      ['WASD', 'move'],
+      ['MOUSE', 'aim and throw sparks'],
+      ['SPACE', 'dash through danger'],
+      ['SHIFT', 'bloom, once the ring is lit'],
       ['P', 'pause'],
     ];
+    const keyPad = 22;
+    let keyCol = 0;
+    let verbCol = 0;
+    ctx.font = '700 13px ui-sans-serif, system-ui, sans-serif';
+    for (const [key] of lines) keyCol = Math.max(keyCol, ctx.measureText(key).width + keyPad);
+    ctx.font = '500 15px ui-sans-serif, system-ui, sans-serif';
+    for (const [, what] of lines) verbCol = Math.max(verbCol, ctx.measureText(what).width);
+    const gap = 18;
+    const blockLeft = VIEW.width / 2 - (keyCol + gap + verbCol) / 2;
     lines.forEach(([key, what], index) => {
-      const y = 404 + index * 30;
-      ctx.textAlign = 'right';
-      ctx.fillStyle = PALETTE.ember;
-      ctx.fillText(key, VIEW.width / 2 - 18, y);
+      const rowY = 420 + index * 31;
+      ctx.font = '700 13px ui-sans-serif, system-ui, sans-serif';
+      ctx.fillStyle = 'rgba(255, 181, 74, 0.16)';
+      roundRect(blockLeft, rowY - 15, keyCol, 24, 6);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255, 181, 74, 0.5)';
+      ctx.lineWidth = 1;
+      roundRect(blockLeft, rowY - 15, keyCol, 24, 6);
+      ctx.stroke();
+      ctx.fillStyle = PALETTE.wick;
+      ctx.textAlign = 'center';
+      ctx.fillText(key, blockLeft + keyCol / 2, rowY);
+      ctx.fillStyle = PALETTE.bone;
+      ctx.font = '500 15px ui-sans-serif, system-ui, sans-serif';
       ctx.textAlign = 'left';
-      ctx.fillStyle = PALETTE.ash;
-      ctx.fillText(what, VIEW.width / 2 + 18, y);
+      ctx.fillText(what, blockLeft + keyCol + gap, rowY);
     });
 
-    const pulse = 0.6 + 0.4 * Math.sin((state?.time ?? 0) * 3.2);
+    // A rule, then the call to action on its own line: the primary action gets the space.
+    ctx.strokeStyle = 'rgba(233, 239, 249, 0.16)';
+    ctx.beginPath();
+    ctx.moveTo(VIEW.width / 2 - 180, 582);
+    ctx.lineTo(VIEW.width / 2 + 180, 582);
+    ctx.stroke();
+
+    const pulse = 0.72 + 0.28 * Math.sin((state?.time ?? 0) * 3.2);
     ctx.textAlign = 'center';
     ctx.globalAlpha = entry * pulse;
     ctx.fillStyle = PALETTE.bone;
-    ctx.font = '700 22px ui-sans-serif, system-ui, sans-serif';
-    ctx.fillText('press ENTER or click to begin', VIEW.width / 2, 588);
+    ctx.font = '700 25px ui-sans-serif, system-ui, sans-serif';
+    ctx.fillText('press ENTER or click to begin', VIEW.width / 2, 622);
     ctx.globalAlpha = entry;
-    ctx.fillStyle = PALETTE.ash;
-    ctx.font = '600 14px ui-sans-serif, system-ui, sans-serif';
-    ctx.fillText(`best ${extra?.best ?? 0}`, VIEW.width / 2, 622);
+    ctx.fillStyle = PALETTE.ember;
+    ctx.font = '700 13px ui-sans-serif, system-ui, sans-serif';
+    const best = extra?.best ?? 0;
+    // Thousands-separated, and with the run it came from: a bare four-digit number under the title
+    // reads as a layout artefact, not as a score to beat.
+    ctx.fillText(
+      best > 0 ? `BEST RUN  ${best.toLocaleString('en-US')}` : 'NO RUN YET — THE FLAME IS UNLIT',
+      VIEW.width / 2,
+      656,
+    );
     ctx.restore();
     ctx.globalAlpha = 1;
   }
@@ -763,6 +1115,7 @@ export function createRenderer(canvas) {
       const x = startX + index * (cardWidth + gap);
       const y = 280;
       const hovered = extra?.hover === index;
+      const tone = COLOUR[card.tone] ?? PALETTE.wick;
       ctx.fillStyle = hovered ? 'rgba(255, 181, 74, 0.16)' : 'rgba(19, 27, 49, 0.94)';
       roundRect(x, y, cardWidth, cardHeight, 18);
       ctx.fill();
@@ -771,19 +1124,46 @@ export function createRenderer(canvas) {
       roundRect(x, y, cardWidth, cardHeight, 18);
       ctx.stroke();
 
+      // A tone band across the top of the card: at sheet scale the colour is the only thing that
+      // survives, so it carries the category (hot, quick, wide) before any word does.
+      ctx.save();
+      roundRect(x, y, cardWidth, cardHeight, 18);
+      ctx.clip();
+      ctx.fillStyle = tone;
+      ctx.globalAlpha = hovered ? 0.5 : 0.3;
+      ctx.fillRect(x, y, cardWidth, 5);
+      ctx.globalAlpha = 1;
+      ctx.restore();
+
       ctx.fillStyle = PALETTE.ember;
       ctx.font = '800 13px ui-sans-serif, system-ui, sans-serif';
       ctx.fillText(String(index + 1), x + cardWidth / 2, y + 30);
       ctx.fillStyle = PALETTE.bone;
-      ctx.font = '800 25px ui-sans-serif, system-ui, sans-serif';
-      ctx.fillText(card.name, x + cardWidth / 2, y + 76);
-      ctx.fillStyle = COLOUR[card.tone] ?? PALETTE.wick;
-      ctx.font = '700 16px ui-sans-serif, system-ui, sans-serif';
-      ctx.fillText(card.detail, x + cardWidth / 2, y + 112);
+      ctx.font = '800 26px ui-sans-serif, system-ui, sans-serif';
+      ctx.fillText(card.name, x + cardWidth / 2, y + 74);
+
+      // The consequence, at the size the name had: this is the line that decides the pick, and at
+      // 253 px it was collapsing into grey texture while the title stayed legible.
+      ctx.fillStyle = tone;
+      ctx.font = '800 30px ui-sans-serif, system-ui, sans-serif';
+      ctx.fillText(card.detail, x + cardWidth / 2, y + 122);
+
+      // What the number is now, and what it becomes: without a before there is no axis to compare
+      // three cards on, only three unrelated claims. Extra hearts are tracked as a bonus over the
+      // base three, so the card reads in hearts the player can count on the HUD, not in a bonus.
+      const bonus = state.stats?.[card.stat];
+      if (typeof bonus === 'number') {
+        const base = card.stat === 'maxHp' ? PLAYER.maxHp : 0;
+        const now = base + bonus;
+        const next = card.step ? now + card.step : card.factor ? now * card.factor : now;
+        ctx.fillStyle = PALETTE.ash;
+        ctx.font = '600 15px ui-sans-serif, system-ui, sans-serif';
+        ctx.fillText(`${round2(now)}  →  ${round2(next)}`, x + cardWidth / 2, y + 152);
+      }
 
       ctx.fillStyle = PALETTE.ash;
       ctx.font = '500 14px ui-sans-serif, system-ui, sans-serif';
-      wrapText(card.blurb, x + cardWidth / 2, y + 152, cardWidth - 44, 20);
+      wrapText(card.blurb, x + cardWidth / 2, y + 186, cardWidth - 44, 20);
 
       if (extra?.taken?.[card.id]) {
         ctx.fillStyle = PALETTE.moth;
@@ -796,48 +1176,87 @@ export function createRenderer(canvas) {
 
   function drawEndCard(state, won, extra) {
     ctx.save();
-    ctx.fillStyle = won ? 'rgba(10, 15, 30, 0.82)' : 'rgba(20, 8, 14, 0.82)';
+    // Nearly opaque: the fight behind a results card is noise, and a moth or a score pop bleeding
+    // through the middle of the card reads as a rendering fault rather than as atmosphere.
+    const veil = ctx.createLinearGradient(0, 0, 0, VIEW.height);
+    if (won) {
+      veil.addColorStop(0, 'rgba(8, 12, 24, 0.94)');
+      veil.addColorStop(1, 'rgba(5, 7, 15, 0.97)');
+    } else {
+      veil.addColorStop(0, 'rgba(24, 9, 16, 0.94)');
+      veil.addColorStop(1, 'rgba(10, 5, 9, 0.97)');
+    }
+    ctx.fillStyle = veil;
     ctx.fillRect(0, 0, VIEW.width, VIEW.height);
     ctx.textAlign = 'center';
     ctx.fillStyle = won ? PALETTE.ember : PALETTE.blood;
-    ctx.font = '800 64px ui-sans-serif, system-ui, sans-serif';
-    ctx.fillText(won ? 'THE FLAME HOLDS' : 'THE WICK GOES OUT', VIEW.width / 2, 250);
+    ctx.font = '800 60px ui-sans-serif, system-ui, sans-serif';
+    ctx.fillText(won ? 'THE FLAME HOLDS' : 'THE WICK GOES OUT', VIEW.width / 2, 232);
     ctx.fillStyle = PALETTE.ash;
     ctx.font = '600 17px ui-sans-serif, system-ui, sans-serif';
     ctx.fillText(
       won ? 'All ten waves broken. The dark steps back.' : `You fell in wave ${Math.min(state.waveIndex + 1, 10)} of ten.`,
       VIEW.width / 2,
-      292,
+      270,
     );
 
+    // The score, once: the results screen is the only place this run's number is printed, so it can
+    // be the biggest thing on the card without competing with a live HUD behind it.
     ctx.fillStyle = PALETTE.bone;
-    ctx.font = '800 58px ui-sans-serif, system-ui, sans-serif';
-    ctx.fillText(String(state.score), VIEW.width / 2, 384);
+    ctx.font = '800 62px ui-sans-serif, system-ui, sans-serif';
+    ctx.fillText(state.score.toLocaleString('en-US'), VIEW.width / 2, 360);
     ctx.fillStyle = PALETTE.ash;
-    ctx.font = '600 14px ui-sans-serif, system-ui, sans-serif';
-    ctx.fillText('SCORE', VIEW.width / 2, 412);
+    ctx.font = '700 12px ui-sans-serif, system-ui, sans-serif';
+    ctx.fillText(won && extra?.record ? 'SCORE — A NEW BEST' : 'SCORE', VIEW.width / 2, 386);
 
+    // Four readings, not five: the score is already the hero above, so repeating it as "best" only
+    // filled a column. A record is called a record instead of showing the same number twice.
     const stats = [
-      ['waves cleared', `${Math.min(state.waveIndex, 10)}`],
+      ['waves cleared', `${Math.min(state.waveIndex, 10)} of 10`],
       ['slain', `${state.kills}`],
+      ['flawless', `${state.flawless ?? 0} of 10`],
       ['time', formatClock(state.time)],
-      ['best', String(extra?.best ?? state.score)],
     ];
     stats.forEach(([label, value], index) => {
       const x = VIEW.width / 2 - 300 + index * 200;
       ctx.fillStyle = PALETTE.ember;
-      ctx.font = '800 22px ui-sans-serif, system-ui, sans-serif';
-      ctx.fillText(value, x, 480);
+      ctx.font = '800 24px ui-sans-serif, system-ui, sans-serif';
+      ctx.fillText(value, x, 456);
       ctx.fillStyle = PALETTE.ash;
-      ctx.font = '600 12px ui-sans-serif, system-ui, sans-serif';
-      ctx.fillText(label, x, 502);
+      ctx.font = '600 13px ui-sans-serif, system-ui, sans-serif';
+      ctx.fillText(label, x, 480);
     });
 
-    const pulse = 0.6 + 0.4 * Math.sin(state.time * 3.2);
-    ctx.globalAlpha = pulse;
+    // The one thing the player has to do next, drawn as a key cap with a chip per key rather than a
+    // sentence in the dimmest colour on the card.
+    ctx.strokeStyle = won ? 'rgba(255, 181, 74, 0.28)' : 'rgba(255, 77, 109, 0.28)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(VIEW.width / 2 - 220, 518);
+    ctx.lineTo(VIEW.width / 2 + 220, 518);
+    ctx.stroke();
+
+    const bounce = 0.86 + 0.14 * Math.sin(state.time * 3.4);
+    ctx.globalAlpha = bounce;
     ctx.fillStyle = PALETTE.wick;
-    ctx.font = '700 20px ui-sans-serif, system-ui, sans-serif';
-    ctx.fillText('press R or ENTER to run again', VIEW.width / 2, 570);
+    ctx.font = '700 26px ui-sans-serif, system-ui, sans-serif';
+    ctx.fillText('press R or ENTER to run again', VIEW.width / 2, 592);
+    ctx.globalAlpha = 1;
+
+    // The run's build, under the results: the draft is the game's thesis, so the card that ends the
+    // run shows what the keeper actually assembled out of it instead of only what it scored.
+    drawBuildStrip(state, 548);
+
+    // The tip, clearly subordinate: one line of what the next run should chase.
+    ctx.fillStyle = won ? PALETTE.moth : PALETTE.ash;
+    ctx.font = '600 14px ui-sans-serif, system-ui, sans-serif';
+    ctx.fillText(
+      won
+        ? `${state.flawless ?? 0} of 10 waves held without a scratch. Chase ten.`
+        : `You held ${state.flawless ?? 0} clean — a wave with no hit pays a flawless bonus.`,
+      VIEW.width / 2,
+      640,
+    );
     ctx.restore();
     ctx.globalAlpha = 1;
   }

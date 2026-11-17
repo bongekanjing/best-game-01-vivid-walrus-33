@@ -85,6 +85,10 @@ export const WAVE = {
   breather: 2.0,
   spawnGap: 0.22,
   bossWaves: [5, 10],
+  /** From this wave on, one body in the queue is an elite: tougher, brighter, worth far more. */
+  firstEliteWave: 3,
+  /** How long the wave banner hangs over the field when a wave opens. */
+  bannerTime: 2.4,
 };
 
 /** Scoring: everything the keeper does is worth something, so the HUD always moves. */
@@ -96,4 +100,8 @@ export const SCORE = {
   comboWindow: 2.6,
   comboStep: 0.12,
   comboMax: 3,
+  /** A wave held without a single hit: the skill reward the score is built around. */
+  perFlawless: 120,
+  /** An elite's own score is multiplied by this before the combo is applied. */
+  eliteBonus: 2.5,
 };

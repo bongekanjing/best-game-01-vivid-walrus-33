@@ -6,7 +6,7 @@
 // instead of running the loop, paints it, and sets window.__shotReady so a screenshot can be taken.
 
 import { BOONS, baseStats, boonById, countBoons, drawBoons } from './boons.js';
-import { STEP } from './config.js';
+import { ARENA, STEP, VIEW } from './config.js';
 import { createAudio } from './audio.js';
 import { createInput } from './input.js';
 import { createRandom } from './random.js';
@@ -22,7 +22,18 @@ const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
 
 const canvas = document.getElementById('game');
 const statusLine = document.getElementById('status');
-const renderer = createRenderer(canvas);
+const renderer = createRenderer(canvas, { shotMode: Boolean(shot) });
+
+// A screenshot scene pins the canvas to the logical field. The page is captured at 1280x720 but a
+// headless viewport is 80 px shorter than its window, and the canvas is CSS-stretched to fill it,
+// so without this the field is scaled to 89% and every capture carries a dead band along the bottom.
+if (shot) {
+  canvas.style.width = `${VIEW.width}px`;
+  canvas.style.height = `${VIEW.height}px`;
+  canvas.style.inset = 'auto';
+  canvas.style.left = '0';
+  canvas.style.top = '0';
+}
 const audio = createAudio();
 const input = createInput(canvas);
 
@@ -362,48 +373,124 @@ function playForwardTo(target, seconds, pilot) {
  * density (enemies near the keeper, sparks and spits in flight) across a whole play-through. These
  * are seconds, so a seed plus a step count reproduces the frame exactly.
  */
-const PLAY_MARK = 53.52; // the fifth wave's warden, ringed by spits, at its busiest
 const DRAFT_MARK = 58.6; // the breather after the fifth wave's warden falls, where a draft opens
 const DODGE_UNTIL = 130; // the loss scene stops dodging here; seed 99's tenth wave takes it
 
+/** A fresh world at the staged starting point: the base stats with the opening two boons taken. */
+function stagedWorld(seed) {
+  const world = createWorld(createRandom(seed));
+  world.reset(baseStats(), []);
+  applyBoon(world.state.stats, boonById('quickwick'));
+  applyBoon(world.state.stats, boonById('twinflame'));
+  world.reset(world.state.stats, ['quickwick', 'twinflame']);
+  return world;
+}
+
+/**
+ * Play a staged run forward and return the second at which `score` peaks. The run is replayed from
+ * a fresh world, so the returned time lands on the same state however the caller gets there. A
+ * negative score means "never a candidate": the step is skipped.
+ */
+function densestMoment(world, seconds, score) {
+  let best = { seconds: 0, value: -Infinity };
+  const steps = Math.round(seconds / STEP);
+  for (let i = 0; i < steps; i += 1) {
+    if (world.state.over) break;
+    const plan = autopilot(world.state);
+    step(world, STEP, { axis: plan.axis, aim: plan.aim, firing: plan.firing, took: (a) => a === 'bloom' && plan.bloom }, 0);
+    const value = score(world.state);
+    if (value > best.value) best = { seconds: world.state.time, value };
+  }
+  return best.value > 0 ? best : { seconds: world.state.time * 0.6, value: 0 };
+}
+
+/** Rebuild the staged run and play it to `seconds`, so the caller draws the frame it picked. */
+function restage(seed, seconds) {
+  const world = stagedWorld(seed);
+  playForwardTo(world, seconds, autopilot);
+  return world;
+}
+
 function stageShot(name) {
   const seed = Number.isInteger(seedParam) ? seedParam : 1;
-  const target = createWorld(createRandom(seed));
-  target.reset(baseStats(), []);
-  // Two boons deep, as any run past the first draft would be: the scenes are the game mid-run.
-  applyBoon(target.state.stats, boonById('quickwick'));
-  applyBoon(target.state.stats, boonById('twinflame'));
-  target.reset(target.state.stats, ['quickwick', 'twinflame']);
-  const state = target.state;
 
   if (name === 'start') {
-    renderer.drawTitle({ time: 2.4 }, { best: 1280 });
+    // A saved best from an earlier run, as the title card shows a returning player: a real score
+    // the game deals, not a placeholder, so the frame does not advertise a number it never made.
+    renderer.drawTitle({ time: 2.4 }, { best: 21499 });
     return;
   }
 
   if (name === 'play') {
-    // Late in the tenth wave, at the moment the arena is most crowded: the warden and its escort
-    // alive, a score of six figures' worth of kills behind it, spits in the air and the keeper on
-    // its last heart. Chosen by sweeping the run's own density, so this is a frame it really hits.
-    playForwardTo(target, PLAY_MARK, autopilot);
-    renderer.draw(state, null, { best: 2410 });
+    // Rather than a hand-tuned timestamp that drifts whenever the balance changes, the scene finds
+    // the busiest frame this run actually reaches: it scores every step on what a screenshot should
+    // show (bodies on the field, threats near the keeper, a warden alive) and re-plays to that step.
+    // Deterministic, so the same seed always gives the same picture.
+    const mark = densestMoment(stagedWorld(seed), 240, (state) => {
+      const enemies = state.bodies.filter((body) => body.kind === 'enemy' && body.hp > 0);
+      const near = enemies.filter((body) => Math.hypot(body.x - state.player.x, body.y - state.player.y) < 340).length;
+      const spits = state.bodies.filter((body) => body.kind === 'spit').length;
+      const sparks = state.bodies.filter((body) => body.kind === 'spark').length;
+      // Live score pops are the clearest proof the loop pays out; a frame mid-cascade shows numbers.
+      const pops = (state.popups ?? []).filter((popup) => popup.life > 0.25).length;
+      const elites = enemies.filter((body) => body.elite).length;
+      const warden = state.boss && state.boss.hp > 0 ? 1 : 0;
+      // A banner over the field is a title card, not a fight: skip those frames outright.
+      if (state.banner && state.bannerClock > 0.35) return -1;
+      // The keeper has to be somewhere a viewer can find it. A frame that scores well with the moth
+      // pinned against the top wall puts it under the HUD strip, which is how a dense shot ends up
+      // with no visible protagonist at all.
+      const { x, y } = state.player;
+      const inFrame =
+        x > ARENA.x + 120 && x < ARENA.x + ARENA.width - 120 &&
+        y > ARENA.y + 150 && y < ARENA.y + ARENA.height - 90;
+      if (!inFrame) return -1;
+      // Mid-field counts double, and a live spark in flight counts more than a body: the shot has to
+      // show the keeper shooting, not only standing in a crowd. A live warden is worth far more than
+      // any body count — it is the one thing that shows the run has authored encounters in it.
+      const centred = Math.hypot(x - (ARENA.x + ARENA.width / 2), y - (ARENA.y + ARENA.height / 2)) < 260 ? 8 : 0;
+      // Bodies standing on the warden steal its silhouette: a wounded minion tucked under its edge
+      // prints its own hairline health bar across the boss, which reads as a stray bar on the boss
+      // rather than as a minion at low health. A legible warden is worth more than two more bodies.
+      let crowding = 0;
+      if (state.boss && state.boss.hp > 0) {
+        crowding = enemies.filter((body) => Math.hypot(body.x - state.boss.x, body.y - state.boss.y) < state.boss.radius + 46).length;
+      }
+      // How many of the arena's nine regions hold a body. A frame whose bodies all sit in the middle
+      // third is a crowd, not a fight: the empty corners read as a stage that is only half used.
+      let spread = 0;
+      for (let gx = 0; gx < 3; gx += 1) {
+        for (let gy = 0; gy < 3; gy += 1) {
+          const x0 = ARENA.x + (ARENA.width / 3) * gx;
+          const y0 = ARENA.y + (ARENA.height / 3) * gy;
+          const filled = enemies.some((body) => body.x >= x0 && body.x < x0 + ARENA.width / 3 && body.y >= y0 && body.y < y0 + ARENA.height / 3);
+          if (filled) spread += 1;
+        }
+      }
+      return enemies.length * 2 + near * 2.2 + spits * 1.5 + sparks * 1.3 + elites * 4 + warden * 50 + centred - crowding * 12 + spread * 3 + Math.min(pops, 4) * 14;
+    });
+    const busy = restage(seed, mark.seconds);
+    renderer.draw(busy.state, null, {});
     return;
   }
 
   if (name === 'boons') {
-    // A draft between waves: the same run, held at the moment a wave is cleared.
-    playForwardTo(target, DRAFT_MARK, autopilot);
-    const offers = drawBoons(target.random, state.boons, 3);
-    renderer.draw(state, SCREEN_BOONS, { cards: offers, hover: 1, taken: Object.fromEntries(countBoons(state.boons)) });
+    // A draft between waves: the same run, held at the moment a wave is cleared. The cards come off
+    // the run's own generator, so they are the three this seed would really offer.
+    const world = stagedWorld(seed);
+    playForwardTo(world, DRAFT_MARK, autopilot);
+    const offers = drawBoons(world.random, world.state.boons, 3);
+    renderer.draw(world.state, SCREEN_BOONS, { cards: offers, hover: 1, taken: Object.fromEntries(countBoons(world.state.boons)) });
     return;
   }
 
   if (name === 'end') {
     // A real loss: the keeper dodges until DODGE_UNTIL and then walks into the wave, so the death
     // is dealt by the simulation. The card reports the wave and score the run actually reached.
-    playForwardTo(target, DODGE_UNTIL, autopilot);
-    playForwardTo(target, 400, reckless);
-    renderer.draw(state, state.won ? SCREEN_WIN : SCREEN_OVER, { best: state.score });
+    const world = stagedWorld(seed);
+    playForwardTo(world, DODGE_UNTIL, autopilot);
+    playForwardTo(world, 400, reckless);
+    renderer.draw(world.state, world.state.won ? SCREEN_WIN : SCREEN_OVER, {});
     return;
   }
 
@@ -411,29 +498,23 @@ function stageShot(name) {
     // A real win: the autopilot sees a whole run through to the tenth wave's clear. Seeds differ in
     // how hard the waves fall, so the scene walks a short list until one really is won rather than
     // writing a victory card over a lost run: the frame stays a run the rules actually dealt.
-    const WIN_SEEDS = [7, 11, 14, 15, 16, 6];
+    const WIN_SEEDS = [1, 2, 23, 166, 193, 4];
     const wanted = Number.isInteger(seedParam) ? seedParam : null;
     const candidates = wanted === null ? WIN_SEEDS : [wanted, ...WIN_SEEDS];
     let bestSeen = null;
     for (const candidate of candidates) {
-      const attempt = candidate === seed ? target : null;
-      const world = attempt ?? createWorld(createRandom(candidate));
-      if (!attempt) {
-        world.reset(baseStats(), []);
-        applyBoon(world.state.stats, boonById('quickwick'));
-        applyBoon(world.state.stats, boonById('twinflame'));
-        world.reset(world.state.stats, ['quickwick', 'twinflame']);
-      }
+      const world = stagedWorld(candidate);
       playForwardTo(world, 400, autopilot);
       if (world.state.won) {
-        renderer.draw(world.state, SCREEN_WIN, { best: world.state.score });
+        renderer.draw(world.state, SCREEN_WIN, { record: true });
         return;
       }
       if (bestSeen === null || world.state.score > bestSeen.state.score) {
         bestSeen = world;
       }
     }
-    renderer.draw(bestSeen.state, SCREEN_OVER, { best: bestSeen.state.score });
+    // No seed won: draw the best attempt as the loss it was rather than a false victory.
+    renderer.draw(bestSeen.state, SCREEN_OVER, {});
     return;
   }
 

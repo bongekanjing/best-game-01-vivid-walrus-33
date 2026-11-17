@@ -95,7 +95,7 @@ export const BOONS = [
     id: 'brightbloom',
     name: 'Bright Bloom',
     blurb: 'The bloom burns wider and fills with fewer motes.',
-    detail: 'Bloom +1 size',
+    detail: 'Bloom +18%',
     stat: 'bloom',
     factor: 1.18,
     tone: 'bloom',

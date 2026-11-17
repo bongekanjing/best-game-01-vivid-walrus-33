@@ -107,6 +107,7 @@ function blankState() {
     bodies: [],
     motes: [],
     particles: [],
+    popups: [],
     stats: defaultStats(),
     boons: [],
     boss: null,
@@ -114,6 +115,13 @@ function blankState() {
     nextId: 1,
     over: false,
     won: false,
+    /** The run's own tally, for the HUD and the end card: a wave held clean is worth noticing. */
+    flawless: 0,
+    waveClean: true,
+    banner: '',
+    bannerClock: 0,
+    bannerKind: 'wave',
+    elites: 0,
   };
 }
 
@@ -152,49 +160,59 @@ function rimPoint(state, margin) {
   const player = state.player;
   for (let tries = 0; tries < 24; tries += 1) {
     const edge = Math.floor(roll(state) * 4);
-    const pad = 34;
+    // Enough inset that even a warden's silhouette lands fully inside the frame: a body that spawns
+    // half over the border reads as a rendering bug before it reads as a threat.
+    const pad = 52;
+    // The top rim sits lower than the rest: the HUD strip and the warden's health plate own the top
+    // ~120 px of the field, and a body that walks in underneath them is a sprite stuck to the HUD.
+    const topPad = 128;
+    // The bottom rim clears the build dock the same way the top rim clears the HUD strip: a body
+    // that spawns on the floor line sits behind the chips and reads as a sprite stuck under the HUD.
+    const bottomPad = 96;
     let x;
     let y;
     if (edge === 0) {
       x = ARENA.x + pad + roll(state) * (ARENA.width - pad * 2);
-      y = ARENA.y + pad;
+      y = ARENA.y + topPad;
     } else if (edge === 1) {
       x = ARENA.x + ARENA.width - pad;
-      y = ARENA.y + pad + roll(state) * (ARENA.height - pad * 2);
+      y = ARENA.y + topPad + roll(state) * (ARENA.height - topPad - bottomPad);
     } else if (edge === 2) {
       x = ARENA.x + pad + roll(state) * (ARENA.width - pad * 2);
-      y = ARENA.y + ARENA.height - pad;
+      y = ARENA.y + ARENA.height - bottomPad;
     } else {
       x = ARENA.x + pad;
-      y = ARENA.y + pad + roll(state) * (ARENA.height - pad * 2);
+      y = ARENA.y + topPad + roll(state) * (ARENA.height - topPad - bottomPad);
     }
     if (Math.hypot(x - player.x, y - player.y) >= margin) return { x, y };
   }
   return { x: ARENA.x + ARENA.width / 2, y: ARENA.y + 40 };
 }
 
-function spawnBody(state, recipe, x, y) {
+function spawnBody(state, recipe, x, y, elite = false) {
+  const hp = elite ? Math.round(recipe.hp * 2.4) : recipe.hp;
   const body = {
     id: state.nextId++,
     kind: KIND_ENEMY,
     recipe: recipe.id,
-    name: recipe.name,
+    name: elite ? `Elder ${recipe.name}` : recipe.name,
     behaviour: recipe.behaviour,
     x,
     y,
     vx: 0,
     vy: 0,
-    radius: recipe.radius,
-    hp: recipe.hp,
-    maxHp: recipe.hp,
-    speed: recipe.speed,
+    radius: elite ? recipe.radius * 1.22 : recipe.radius,
+    hp,
+    maxHp: hp,
+    speed: recipe.speed * (elite ? 0.9 : 1),
     damage: recipe.damage,
     colour: recipe.colour,
     accent: recipe.accent,
-    score: recipe.score,
-    motes: recipe.motes,
+    score: elite ? Math.round(recipe.score * SCORE.eliteBonus) : recipe.score,
+    motes: elite ? Math.min(8, (recipe.motes ?? 1) * 3) : recipe.motes,
     children: recipe.children ?? null,
     boss: Boolean(recipe.boss),
+    elite,
     ringCooldown: recipe.ringCooldown ?? 0,
     ringCount: recipe.ringCount ?? 0,
     ringSpeed: recipe.ringSpeed ?? 0,
@@ -204,7 +222,8 @@ function spawnBody(state, recipe, x, y) {
     invuln: 0.35,
     state: 'idle',
     stateClock: 0,
-    cooldown: recipe.boss ? 2.4 : recipe.spitCooldown ?? 1.6,
+    // An elite opens its first attack sooner, so meeting one changes the shape of the fight.
+    cooldown: (recipe.boss ? 2.4 : recipe.spitCooldown ?? 1.6) * (elite ? 0.7 : 1),
     phase: roll(state) * 6.28,
     hurt: 0,
     angle: 0,
@@ -225,23 +244,32 @@ function queueWave(state) {
   state.spawnQueue = [];
   state.phase = PHASE_FIGHT;
   state.phaseClock = 0;
+  state.banner = wave.name;
+  state.bannerKind = wave.boss ? 'boss' : 'wave';
+  state.bannerClock = WAVE.bannerTime;
+  // One elite per wave from the third on: two of them in the later waves, so the field keeps
+  // asking a different question instead of only more of the same one.
+  const eliteSlots = wave.boss ? 1 : wave.index >= 8 ? 2 : wave.index >= WAVE.firstEliteWave ? 1 : 0;
   const bosses = wave.entries.filter((id) => id === 'warden');
   const others = wave.entries.filter((id) => id !== 'warden');
   let order = 0;
   for (const id of bosses) {
     const point = rimPoint(state, 300);
-    state.spawnQueue.push({ recipe: tuneEnemy(id, wave), x: point.x, y: point.y, at: 0.4 });
+    state.spawnQueue.push({ recipe: tuneEnemy(id, wave), x: point.x, y: point.y, at: 0.4, elite: false });
     order += 1;
   }
   const normalCount = wave.boss ? Math.max(2, wave.count - 1) : wave.count;
   for (let i = 0; i < normalCount; i += 1) {
     const id = others[i % others.length];
     const point = rimPoint(state, 170);
+    // The elite is the last body out, so it walks into a fight already in progress.
+    const elite = eliteSlots > 0 && i >= normalCount - eliteSlots;
     state.spawnQueue.push({
       recipe: tuneEnemy(id, wave),
       x: point.x,
       y: point.y,
       at: 1.1 + WAVE.spawnGap * order,
+      elite,
     });
     order += 1;
   }
@@ -264,11 +292,16 @@ function stepDirector(state, dt, events) {
   state.waveClock += dt;
   while (state.spawnQueue.length > 0 && state.spawnQueue[0].at <= state.waveClock) {
     const head = state.spawnQueue.shift();
-    const body = spawnBody(state, head.recipe, head.x, head.y);
+    const body = spawnBody(state, head.recipe, head.x, head.y, head.elite);
     if (body.boss) {
       state.boss = body;
       state.bossMaxHp = body.maxHp;
       state.shake = Math.max(state.shake, 10);
+    } else if (body.elite) {
+      // An elite is announced by its crown and its size on the field, not by a title card: a second
+      // named banner over a fight that already has a warden on it reads as two bosses at once.
+      state.elites += 1;
+      state.shake = Math.max(state.shake, 4);
     } else {
       state.shake = Math.max(state.shake, 1.1);
     }
@@ -278,6 +311,16 @@ function stepDirector(state, dt, events) {
   const enemiesLeft = state.bodies.some((body) => body.kind === KIND_ENEMY && body.hp > 0);
   if (!enemiesLeft && state.waveClock > 1) {
     state.score += SCORE.perWave * (state.waveIndex + 1);
+    // A wave held without a scratch is the run's best evidence of skill, so it pays for itself.
+    if (state.waveClean) {
+      state.flawless += 1;
+      state.score += SCORE.perFlawless * (state.waveIndex + 1);
+      state.banner = 'Flawless';
+      state.bannerKind = 'flawless';
+    } else {
+      state.banner = '';
+    }
+    state.waveClean = true;
     state.waveIndex += 1;
     state.boss = null;
     if (state.waveIndex >= WAVES.length) {
@@ -634,8 +677,16 @@ function damageBody(state, body, amount) {
   state.kills += 1;
   state.comboTimer = SCORE.comboWindow;
   state.combo = Math.min(SCORE.comboMax, state.combo + SCORE.comboStep);
-  state.score += Math.round(body.score * state.combo);
+  const worth = Math.round(body.score * state.combo);
+  state.score += worth;
   state.shake = Math.max(state.shake, body.boss ? 12 : 2.4);
+  // A price tag over every kill: the score is the game's other weapon, so it has to be visible.
+  // Pops close together are merged rather than stacked, so a crowd dying in one bloom does not
+  // bury the enemies still alive under a wall of numbers.
+  pushPopup(state, body.x, body.y - body.radius * 0.5, worth, {
+    kind: body.boss ? 'boss' : body.elite ? 'elite' : 'kill',
+    life: body.boss ? 1.1 : 0.62,
+  });
 
   const burst = body.boss ? 24 : 7;
   for (let i = 0; i < burst; i += 1) {
@@ -694,6 +745,8 @@ function hurtPlayer(state, damage, push) {
   state.shake = Math.max(state.shake, 9);
   state.combo = 1;
   state.comboTimer = 0;
+  // The wave is no longer clean: the flawless bonus is spent the moment the keeper is touched.
+  state.waveClean = false;
   for (let i = 0; i < 12; i += 1) {
     const angle = (i / 12) * Math.PI * 2;
     state.particles.push({
@@ -778,6 +831,43 @@ function stepParticles(state, dt) {
 }
 
 /**
+ * Add one score pop, merging it into a live pop within 34 px so a bloom that kills six bodies at
+ * once reads as one bigger number instead of six overlapping ones.
+ */
+function pushPopup(state, x, y, value, { kind = 'kill', life = 0.62 } = {}) {
+  for (const popup of state.popups) {
+    // A pop within 34 px swallows the new value, and one that already sits within 56 px is nudged
+    // aside instead: two pops that close stack into a single unreadable blob precisely where the
+    // player is looking, so a nearby pop claims the space and the new one is offset from it.
+    const gap = Math.hypot(popup.x - x, popup.y - y);
+    if (popup.kind === kind && gap <= 34) {
+      popup.value += value;
+      popup.life = Math.max(popup.life, life);
+      popup.maxLife = Math.max(popup.maxLife, life);
+      popup.merges = (popup.merges ?? 1) + 1;
+      return;
+    }
+    if (popup.kind === kind && gap <= 56) {
+      y -= 18;
+      x += 12;
+    }
+  }
+  state.popups.push({ x, y, value, life, maxLife: life, kind, merges: 1 });
+}
+
+/** Score pops drift up and fade; like the particles, they are capped so a busy wave stays cheap. */
+function stepPopups(state, dt) {
+  for (const popup of state.popups) {
+    // A merged pop rises faster, so the eye is pulled to the bigger number it has become.
+    popup.life -= dt;
+    popup.y -= (26 + Math.min(popup.merges - 1, 4) * 9) * dt;
+  }
+  if (state.popups.length > 24) state.popups.splice(0, state.popups.length - 24);
+  state.popups = state.popups.filter((popup) => popup.life > 0);
+  state.bannerClock = Math.max(0, state.bannerClock - dt);
+}
+
+/**
  * Advance the world by exactly one fixed step. `input` is a snapshot the caller built
  * ({ axis, aim, firing, took(name) }); the returned flags say what happened.
  */
@@ -787,6 +877,7 @@ export function step(world, dt, input, events = 0) {
 
   if (state.over) {
     stepParticles(state, dt);
+    stepPopups(state, dt);
     state.hurtFlash = Math.max(0, state.hurtFlash - dt * 2.4);
     state.shake = Math.max(0, state.shake - dt * 34);
     state.bloomPulse = Math.max(0, state.bloomPulse - dt);
@@ -806,5 +897,6 @@ export function step(world, dt, input, events = 0) {
   stepMotes(state, dt, effectiveStats(state));
   events = stepDirector(state, dt, events);
   stepParticles(state, dt);
+  stepPopups(state, dt);
   return events;
 }

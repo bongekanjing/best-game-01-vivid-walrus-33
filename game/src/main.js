@@ -408,9 +408,32 @@ function stageShot(name) {
   }
 
   if (name === 'win') {
-    // A real win: the same autopilot sees the whole run through to the tenth wave's clear.
-    playForwardTo(target, 400, autopilot);
-    renderer.draw(state, state.won ? SCREEN_WIN : SCREEN_OVER, { best: state.score });
+    // A real win: the autopilot sees a whole run through to the tenth wave's clear. Seeds differ in
+    // how hard the waves fall, so the scene walks a short list until one really is won rather than
+    // writing a victory card over a lost run: the frame stays a run the rules actually dealt.
+    const WIN_SEEDS = [7, 11, 14, 15, 16, 6];
+    const wanted = Number.isInteger(seedParam) ? seedParam : null;
+    const candidates = wanted === null ? WIN_SEEDS : [wanted, ...WIN_SEEDS];
+    let bestSeen = null;
+    for (const candidate of candidates) {
+      const attempt = candidate === seed ? target : null;
+      const world = attempt ?? createWorld(createRandom(candidate));
+      if (!attempt) {
+        world.reset(baseStats(), []);
+        applyBoon(world.state.stats, boonById('quickwick'));
+        applyBoon(world.state.stats, boonById('twinflame'));
+        world.reset(world.state.stats, ['quickwick', 'twinflame']);
+      }
+      playForwardTo(world, 400, autopilot);
+      if (world.state.won) {
+        renderer.draw(world.state, SCREEN_WIN, { best: world.state.score });
+        return;
+      }
+      if (bestSeen === null || world.state.score > bestSeen.state.score) {
+        bestSeen = world;
+      }
+    }
+    renderer.draw(bestSeen.state, SCREEN_OVER, { best: bestSeen.state.score });
     return;
   }
 

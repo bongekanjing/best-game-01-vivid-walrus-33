@@ -644,6 +644,15 @@ export function createRenderer(canvas) {
     ctx.fillStyle = PALETTE.ember;
     ctx.font = '600 20px ui-sans-serif, system-ui, sans-serif';
     ctx.fillText('Ten waves. One keeper. The last flame.', VIEW.width / 2, 308);
+    // The one line the tagline leaves out: what actually wins and loses. A player should not have
+    // to infer the rulebook from the verb list, and the start screen is where the goal belongs.
+    // Drawn one step brighter than the control text so it reads as the rule, not another control.
+    ctx.fillStyle = PALETTE.bone;
+    ctx.font = '600 17px ui-sans-serif, system-ui, sans-serif';
+    ctx.fillText('Clear all ten waves to hold the flame.', VIEW.width / 2, 342);
+    ctx.fillStyle = PALETTE.ash;
+    ctx.font = '500 15px ui-sans-serif, system-ui, sans-serif';
+    ctx.fillText('Lose all three hearts and the wick goes out.', VIEW.width / 2, 366);
 
     // A lone moth above the wordmark, beating its wings on the clock.
     const bob = Math.sin((state?.time ?? 0) * 2.4) * 6;
